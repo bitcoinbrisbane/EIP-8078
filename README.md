@@ -1,1 +1,1540 @@
 # EIP-8078
+
+---
+eip: 8078
+title: Contract Event Subscription
+description: Allows contracts to subscribe to and react to events emitted by other contracts with gas-bounded execution
+author: Lucas Cullen (@bitcoinbrisbane) <lucas@bitcoinbrisbane.com.au>
+discussions-to: https://ethereum-magicians.org/t/xxxxx
+status: Draft
+type: Standards Track
+category: Core
+created: 2025-11-15
+requires:
+---
+
+## Abstract
+
+This EIP introduces a mechanism for smart contracts to subscribe to events emitted by other contracts and automatically execute callback functions when those events occur. Subscriptions are paid for by the subscribing contract, execute with bounded gas, and fail gracefully without blocking the original transaction if gas runs out or execution fails.
+
+## Motivation
+
+Currently, smart contracts cannot natively react to events emitted by other contracts. Developers must rely on off-chain infrastructure (indexers, bots, relayers) to listen for events and trigger subsequent transactions. This creates several problems:
+
+1. **Centralization**: Requires trusted off-chain infrastructure
+2. **Latency**: Introduces delays between event emission and reaction
+3. **Complexity**: Requires maintaining off-chain services and private keys
+4. **Cost**: Users must pay for multiple transactions
+5. **Atomicity**: Cannot guarantee atomic execution with the original transaction
+
+On-chain event subscriptions would enable:
+
+-   **Reactive DeFi protocols** (automatic liquidations, rebalancing)
+-   **Cross-contract coordination** (DAO proposals triggering dependent actions)
+-   **Decentralized automation** (eliminating relayer centralization)
+-   **Atomic multi-step protocols** (oracle updates triggering derivative settlements)
+
+## Specification
+
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in RFC 2119 and RFC 8174.
+
+### Overview
+
+1. Contracts declare subscribable events using enhanced event syntax
+2. Contracts subscribe to events using a new `subscribe` keyword
+3. When an event is emitted, subscribed callbacks are executed in isolated contexts
+4. Each subscription executes with caller-provided gas limits
+5. Subscription failures are caught and logged but do not revert the parent transaction
+
+### Solidity Language Changes
+
+#### 1. Subscribable Event Declaration
+
+Events can be marked as `subscribable` to indicate they support on-chain subscriptions:
+
+```solidity
+// Basic subscribable event
+event subscribable Transfer(address indexed from, address indexed to, uint256 value);
+
+// Event with subscription gas hint
+event subscribable PriceUpdated(uint256 price) gasHint(100000);
+```
+
+The `gasHint` annotation suggests minimum gas needed for reasonable subscription handling.
+
+#### 2. Subscription Syntax
+
+Contracts subscribe to events using the `subscribe` statement in their constructor or a dedicated subscription management function:
+
+```solidity
+contract Subscriber {
+    // Subscribe in constructor
+    constructor(address targetContract) {
+        subscribe targetContract.Transfer(from, to, value)
+            with onTransfer(from, to, value)
+            gasLimit 150000
+            gasPrice 20 gwei;
+    }
+
+    // Callback function - MUST be payable to receive gas payment refunds
+    function onTransfer(address from, address to, uint256 value)
+        external
+        payable
+        onlyEventCallback
+    {
+        // Handle the event
+        // If this runs out of gas or reverts, the original Transfer event still succeeds
+    }
+
+    // Unsubscribe
+    function cleanup(address targetContract) external {
+        unsubscribe targetContract.Transfer;
+    }
+}
+```
+
+#### 3. Event Callback Modifier
+
+A new modifier `onlyEventCallback` ensures functions can only be called by the EVM's subscription dispatcher:
+
+```solidity
+modifier onlyEventCallback {
+    require(msg.sender == address(0xFFfFfFffFFfffFFfFFfFFFFFffFFFffffFfFFFfF), "Only event callbacks");
+    _;
+}
+```
+
+The special address `0xFFfFfFffFFfffFFfFFfFFFFFffFFFffffFfFFFfF` is reserved for the subscription dispatcher.
+
+#### 4. Subscription Management
+
+```solidity
+// Check if subscribed
+bool isSubscribed = this.isSubscribedTo(targetContract, "Transfer");
+
+// Get subscription details
+(uint256 gasLimit, uint256 gasPrice, address callback) =
+    this.getSubscription(targetContract, "Transfer");
+
+// Update subscription gas parameters
+updateSubscription(targetContract, "Transfer", newGasLimit, newGasPrice);
+```
+
+### EVM Changes
+
+#### 1. New Opcodes
+
+**`SUBSCRIBE` (0x5c)**
+
+-   Stack input: `[target_address, event_signature, callback_address, callback_selector, gas_limit, gas_price]`
+-   Stack output: `[subscription_id]`
+-   Gas cost: 20,000 + storage costs
+-   Creates a subscription record in global subscription storage
+
+**`UNSUBSCRIBE` (0x5d)**
+
+-   Stack input: `[subscription_id]`
+-   Stack output: `[success]`
+-   Gas cost: 5,000 + storage refund
+-   Removes subscription and refunds storage
+
+**`NOTIFYSUBSCRIBERS` (0x5e)**
+
+-   Stack input: `[event_signature, data_offset, data_size]`
+-   Stack output: `[num_notified]`
+-   Gas cost: 2,000 + (500 \* num_subscribers)
+-   Called automatically during LOG operations for subscribable events
+-   Schedules callback executions
+
+#### 2. Subscription Storage Model
+
+Subscriptions are stored in a new EVM state trie separate from contract storage:
+
+```
+SubscriptionKey = keccak256(target_address, event_signature, subscriber_address)
+SubscriptionValue = RLP([callback_address, callback_selector, gas_limit, gas_price, deposit])
+```
+
+#### 3. Event Emission Flow
+
+When a subscribable event is emitted:
+
+```
+1. Event is logged normally (LOG0-LOG4 opcodes)
+2. If event is marked subscribable, NOTIFYSUBSCRIBERS is called
+3. For each subscription:
+   a. Check subscriber has sufficient deposited gas payment
+   b. Deduct gas payment (gas_limit * gas_price) from deposit
+   c. Schedule callback execution in isolated context
+   d. Execute callback with try-catch semantics
+   e. Refund unused gas to subscriber
+   f. Log callback success/failure
+4. Original transaction continues regardless of callback outcomes
+```
+
+#### 4. Callback Execution Context
+
+Callbacks execute in an isolated context:
+
+```
+- msg.sender = 0xFFfFfFffFFfffFFfFFfFFFFFffFFFffffFfFFFfF (subscription dispatcher)
+- tx.origin = original tx.origin (preserved from parent)
+- block.* = same as parent transaction
+- Gas limit = subscription gas_limit
+- Reverts/failures are caught and logged but don't propagate
+- State changes are included if callback succeeds
+- DELEGATECALL and CALLCODE are disabled in callbacks
+```
+
+#### 5. Gas Accounting
+
+Subscription gas costs are separate from the transaction that emits the event:
+
+1. **Subscription Deposit**: Subscribers must deposit ETH to cover future callback executions
+2. **Per-Callback Deduction**: When event is emitted, `gas_limit * gas_price` is deducted from deposit
+3. **Refunds**: Unused gas is refunded to subscriber's deposit balance
+4. **Insufficient Balance**: If deposit insufficient, callback is skipped and event logged
+5. **Withdrawal**: Subscribers can withdraw unused deposits
+
+#### 6. New Precompile: Subscription Manager (0x0a)
+
+Address: `0x000000000000000000000000000000000000000a`
+
+Functions:
+
+-   `deposit(subscription_id)` - Add ETH to subscription deposit
+-   `withdraw(subscription_id, amount)` - Withdraw from deposit
+-   `getBalance(subscription_id)` - Query deposit balance
+-   `getSubscriptionInfo(subscription_id)` - Get subscription details
+
+### Compiler Changes (Solidity)
+
+#### 1. Event Declaration Parsing
+
+The Solidity compiler must:
+
+-   Parse `subscribable` keyword on event declarations
+-   Parse optional `gasHint(uint256)` annotation
+-   Emit metadata indicating event is subscribable
+-   Include subscription hints in contract ABI
+
+```json
+{
+  "type": "event",
+  "name": "Transfer",
+  "inputs": [...],
+  "subscribable": true,
+  "gasHint": 100000
+}
+```
+
+#### 2. Subscribe Statement Compilation
+
+The `subscribe` statement compiles to:
+
+```
+1. Load subscription parameters onto stack
+2. Call SUBSCRIBE opcode
+3. Store returned subscription_id
+4. Emit SubscriptionCreated event for off-chain indexing
+```
+
+#### 3. Built-in Subscription Functions
+
+The compiler provides built-in functions:
+
+```solidity
+// Automatically available in all contracts
+function isSubscribedTo(address target, string memory eventSig) internal view returns (bool);
+function getSubscription(address target, string memory eventSig) internal view returns (...);
+function updateSubscription(address target, string memory eventSig, uint256 gasLimit, uint256 gasPrice) internal;
+```
+
+#### 4. Callback Function Validation
+
+The compiler enforces:
+
+-   Callback functions MUST be `external`
+-   Callback functions SHOULD be `payable` to receive gas refunds
+-   Callback functions MUST use `onlyEventCallback` modifier or equivalent check
+-   Parameter types MUST match subscribed event types
+
+### Client Implementation (Geth)
+
+#### 1. Subscription State Management
+
+New database schema:
+
+```go
+type Subscription struct {
+    ID              common.Hash
+    TargetContract  common.Address
+    EventSignature  common.Hash
+    SubscriberContract common.Address
+    CallbackAddress common.Address
+    CallbackSelector [4]byte
+    GasLimit        uint64
+    GasPrice        *big.Int
+    DepositBalance  *big.Int
+    Active          bool
+}
+```
+
+#### 2. EVM Modification
+
+In `core/vm/evm.go`:
+
+```go
+// New field in EVM struct
+type EVM struct {
+    // ... existing fields
+    SubscriptionManager *SubscriptionManager
+    PendingCallbacks    []*CallbackExecution
+}
+
+// Execute callbacks after main execution
+func (evm *EVM) ProcessCallbacks() error {
+    for _, cb := range evm.PendingCallbacks {
+        evm.executeCallback(cb)
+    }
+    return nil
+}
+
+func (evm *EVM) executeCallback(cb *CallbackExecution) {
+    // Create isolated context
+    snapshot := evm.StateDB.Snapshot()
+
+    // Set special msg.sender
+    evm.Context.Origin = cb.OriginalOrigin
+
+    // Execute with try-catch semantics
+    ret, gasUsed, err := evm.Call(
+        AccountRef(SUBSCRIPTION_DISPATCHER_ADDRESS),
+        cb.CallbackAddress,
+        cb.CallbackData,
+        cb.GasLimit,
+        big.NewInt(0),
+    )
+
+    if err != nil {
+        // Revert callback state changes but continue
+        evm.StateDB.RevertToSnapshot(snapshot)
+        // Log callback failure
+        evm.StateDB.AddLog(&types.Log{
+            Address: cb.SubscriberAddress,
+            Topics:  []common.Hash{CallbackFailedEvent, cb.SubscriptionID},
+            Data:    []byte(err.Error()),
+        })
+    } else {
+        // Refund unused gas
+        refund := (cb.GasLimit - gasUsed) * cb.GasPrice
+        evm.SubscriptionManager.RefundGas(cb.SubscriptionID, refund)
+    }
+}
+```
+
+#### 3. LOG Opcode Modification
+
+In `core/vm/instructions.go`:
+
+```go
+func opLogN(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
+    // ... existing LOG implementation
+
+    // Check if event is subscribable
+    eventSig := scope.Stack.peek().Bytes32()
+    if interpreter.evm.SubscriptionManager.IsSubscribableEvent(scope.Contract.Address(), eventSig) {
+        // Notify subscribers
+        subscribers := interpreter.evm.SubscriptionManager.GetSubscribers(
+            scope.Contract.Address(),
+            eventSig,
+        )
+
+        for _, sub := range subscribers {
+            // Deduct gas from deposit
+            if !sub.DeductGas() {
+                // Insufficient deposit, skip and log
+                interpreter.evm.StateDB.AddLog(insufficientGasLog(sub))
+                continue
+            }
+
+            // Schedule callback
+            callback := &CallbackExecution{
+                SubscriptionID:   sub.ID,
+                SubscriberAddress: sub.SubscriberContract,
+                CallbackAddress:  sub.CallbackAddress,
+                CallbackData:     buildCallbackData(sub, logData),
+                GasLimit:         sub.GasLimit,
+                GasPrice:         sub.GasPrice,
+                OriginalOrigin:   interpreter.evm.Context.Origin,
+            }
+            interpreter.evm.PendingCallbacks = append(
+                interpreter.evm.PendingCallbacks,
+                callback,
+            )
+        }
+    }
+
+    return nil, nil
+}
+```
+
+#### 4. State Trie Extension
+
+Add new subscription trie alongside existing state tries:
+
+```go
+type StateDB struct {
+    // ... existing fields
+    subscriptionTrie Trie
+    subscriptionCache *lru.Cache
+}
+```
+
+#### 5. RPC Extensions
+
+New RPC methods:
+
+```go
+// Get all subscriptions for an address
+eth_getSubscriptions(address) -> []Subscription
+
+// Get subscription details
+eth_getSubscription(subscriptionId) -> Subscription
+
+// Get callback execution history
+eth_getCallbackHistory(subscriptionId, fromBlock, toBlock) -> []CallbackLog
+```
+
+## Rationale
+
+### Design Decisions
+
+**Why isolated execution context?**
+Prevents subscription callbacks from blocking or reverting the original transaction. The emitting contract should not care about subscriber behavior.
+
+**Why require payable callbacks?**
+Enables gas refunds to be returned to the subscribing contract, improving efficiency.
+
+**Why separate deposit model?**
+Prevents DoS attacks where subscriptions drain the emitting contract's gas. Subscribers pay for their own execution.
+
+**Why special dispatcher address?**
+Provides a secure, verifiable way for callbacks to know they're being called by the subscription system rather than an attacker.
+
+**Why bounded gas?**
+Prevents infinite loops or excessive gas consumption from blocking event emission or consuming unreasonable resources.
+
+**Why not use CREATE2 deterministic callbacks?**
+CREATE2 would require deploying a new contract for each subscription, wasting storage and gas. The proposed system is more efficient.
+
+### Alternative Approaches Considered
+
+1. **Event Relayer Precompile**: A precompile that stores events and allows polling. Rejected because it still requires off-chain infrastructure.
+
+2. **Callback in Same Transaction**: Execute callbacks synchronously in the same call frame. Rejected because callback failures would revert the emitting transaction.
+
+3. **Deferred Transaction Queue**: Store callbacks as pending transactions for future blocks. Rejected due to complexity and unpredictable execution timing.
+
+## Backwards Compatibility
+
+This EIP introduces new opcodes and language features but maintains full backwards compatibility:
+
+1. **Existing Contracts**: Continue to work without modification
+2. **Existing Events**: Can be emitted normally; `subscribable` is opt-in
+3. **Non-upgraded Clients**: Can process blocks but will skip subscription execution (fork required)
+4. **ABI Compatibility**: New ABI fields are additive only
+
+### Hard Fork Required
+
+This EIP requires a coordinated hard fork to activate:
+
+-   All clients must implement new opcodes
+-   Subscription state trie must be initialized
+-   Subscription dispatcher precompile must be activated
+
+## Security Considerations
+
+### 1. Reentrancy Protection
+
+Callbacks execute after the main transaction completes, preventing reentrancy attacks on the emitting contract. The isolated context ensures callbacks cannot call back into the emitter within the same transaction.
+
+### 2. Gas Griefing
+
+**Attack**: Subscribing to popular events with insufficient deposits to waste emitter gas.
+
+**Mitigation**:
+
+-   Subscription notification cost (500 gas per subscriber) is low
+-   Insufficient deposits skip execution rather than failing
+-   Emitters can limit subscribable events
+
+### 3. DoS via Excessive Subscriptions
+
+**Attack**: Creating millions of subscriptions to slow down event emission.
+
+**Mitigation**:
+
+-   SUBSCRIBE opcode has high base cost (20,000 gas)
+-   NOTIFYSUBSCRIBERS charges per subscriber (500 gas each)
+-   Practical limit: ~60,000 gas / 500 = ~120 subscribers per event emission
+-   Emitters can choose not to mark events as subscribable
+
+### 4. Front-Running Subscriptions
+
+**Attack**: Front-running subscription creation to intercept events meant for others.
+
+**Mitigation**: Subscriptions are public state; this is expected behavior. Sensitive events should not be subscribable.
+
+### 5. Callback Impersonation
+
+**Attack**: Calling a callback function directly, bypassing event emission.
+
+**Mitigation**: The `onlyEventCallback` modifier checks for the special dispatcher address, which cannot be impersonated by user transactions.
+
+### 6. Deposit Draining
+
+**Attack**: Emitting events rapidly to drain subscriber deposits.
+
+**Mitigation**: Subscribers control their gas limits and can withdraw deposits. This is similar to users controlling their own transaction gas.
+
+### 7. State Inconsistency
+
+**Attack**: Callback executes based on stale state if emitter's state changes before callback runs.
+
+**Mitigation**: Callbacks execute immediately after the emitting transaction in the same block. State is consistent within the transaction context.
+
+### 8. Cross-Contract Reentrancy
+
+**Attack**: Callback modifies state that affects other pending callbacks.
+
+**Mitigation**: Callbacks are executed sequentially in the order they were subscribed. Each callback sees the cumulative state changes from previous callbacks (similar to transaction ordering).
+
+## Reference Implementation
+
+### Solidity Example: Price Oracle with Subscribers
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract PriceOracle {
+    uint256 public price;
+
+    event subscribable PriceUpdated(uint256 newPrice) gasHint(50000);
+
+    function updatePrice(uint256 _price) external {
+        price = _price;
+        emit PriceUpdated(_price);
+        // Subscribers are automatically notified
+    }
+}
+
+contract DerivedProtocol {
+    PriceOracle public oracle;
+    uint256 public lastSyncedPrice;
+    uint256 public depositBalance;
+
+    event PriceSynced(uint256 price);
+    event SubscriptionGasRefund(uint256 amount);
+
+    constructor(address _oracle) payable {
+        oracle = PriceOracle(_oracle);
+
+        // Subscribe to price updates
+        subscribe oracle.PriceUpdated(newPrice)
+            with onPriceUpdate(newPrice)
+            gasLimit 100000
+            gasPrice 20 gwei;
+
+        // Deposit gas payment
+        depositBalance = msg.value;
+    }
+
+    // Callback function - automatically called when PriceUpdated is emitted
+    function onPriceUpdate(uint256 newPrice)
+        external
+        payable
+        onlyEventCallback
+    {
+        lastSyncedPrice = newPrice;
+        emit PriceSynced(newPrice);
+
+        // Process gas refund if any
+        if (msg.value > 0) {
+            depositBalance += msg.value;
+            emit SubscriptionGasRefund(msg.value);
+        }
+
+        // Perform derivative calculations
+        // If this reverts, the oracle's updatePrice() still succeeds
+        rebalancePositions(newPrice);
+    }
+
+    function rebalancePositions(uint256 newPrice) internal {
+        // Complex logic that might fail
+        // Failures are graceful and logged
+    }
+
+    // Withdraw unused deposit
+    function withdrawDeposit(uint256 amount) external {
+        require(depositBalance >= amount, "Insufficient balance");
+        depositBalance -= amount;
+        payable(msg.sender).transfer(amount);
+    }
+}
+```
+
+### Geth Implementation Sketch
+
+```go
+// core/vm/subscription_manager.go
+package vm
+
+type SubscriptionManager struct {
+    stateDB StateDB
+    subscriptions map[common.Hash]*Subscription
+    subscriptionsByEvent map[common.Hash][]*Subscription
+}
+
+func (sm *SubscriptionManager) Subscribe(
+    target common.Address,
+    eventSig common.Hash,
+    subscriber common.Address,
+    callback common.Address,
+    selector [4]byte,
+    gasLimit uint64,
+    gasPrice *big.Int,
+) (common.Hash, error) {
+    // Create subscription ID
+    subID := crypto.Keccak256Hash(
+        target.Bytes(),
+        eventSig.Bytes(),
+        subscriber.Bytes(),
+    )
+
+    // Create subscription record
+    sub := &Subscription{
+        ID:              subID,
+        TargetContract:  target,
+        EventSignature:  eventSig,
+        SubscriberContract: subscriber,
+        CallbackAddress: callback,
+        CallbackSelector: selector,
+        GasLimit:        gasLimit,
+        GasPrice:        gasPrice,
+        DepositBalance:  big.NewInt(0),
+        Active:          true,
+    }
+
+    // Store in state
+    sm.subscriptions[subID] = sub
+
+    // Index by event
+    eventKey := crypto.Keccak256Hash(target.Bytes(), eventSig.Bytes())
+    sm.subscriptionsByEvent[eventKey] = append(
+        sm.subscriptionsByEvent[eventKey],
+        sub,
+    )
+
+    // Persist to trie
+    sm.stateDB.SetSubscription(subID, sub)
+
+    return subID, nil
+}
+
+func (sm *SubscriptionManager) NotifySubscribers(
+    target common.Address,
+    eventSig common.Hash,
+    eventData []byte,
+) []*CallbackExecution {
+    eventKey := crypto.Keccak256Hash(target.Bytes(), eventSig.Bytes())
+    subscribers := sm.subscriptionsByEvent[eventKey]
+
+    callbacks := make([]*CallbackExecution, 0, len(subscribers))
+
+    for _, sub := range subscribers {
+        if !sub.Active {
+            continue
+        }
+
+        // Calculate gas cost
+        gasCost := new(big.Int).Mul(
+            new(big.Int).SetUint64(sub.GasLimit),
+            sub.GasPrice,
+        )
+
+        // Check deposit balance
+        if sub.DepositBalance.Cmp(gasCost) < 0 {
+            // Insufficient balance, skip
+            sm.stateDB.AddLog(&types.Log{
+                Address: sub.SubscriberContract,
+                Topics:  []common.Hash{
+                    InsufficientDepositEvent,
+                    sub.ID,
+                },
+            })
+            continue
+        }
+
+        // Deduct gas
+        sub.DepositBalance.Sub(sub.DepositBalance, gasCost)
+        sm.stateDB.SetSubscription(sub.ID, sub)
+
+        // Build callback data
+        callbackData := append(sub.CallbackSelector[:], eventData...)
+
+        // Create callback execution
+        callbacks = append(callbacks, &CallbackExecution{
+            SubscriptionID:     sub.ID,
+            SubscriberAddress:  sub.SubscriberContract,
+            CallbackAddress:    sub.CallbackAddress,
+            CallbackData:       callbackData,
+            GasLimit:           sub.GasLimit,
+            GasPrice:           sub.GasPrice,
+            OriginalOrigin:     common.Address{}, // Set by caller
+        })
+    }
+
+    return callbacks
+}
+```
+
+## Implementation Guide for Go-Ethereum (Geth)
+
+This section provides a detailed roadmap for implementing EIP-8078 in the go-ethereum (geth) client.
+
+### 1. New Opcodes - Define and Implement
+
+**File: `core/vm/opcodes.go`**
+- Location: Around line 100-120 (in the opcode constant definitions)
+- Add three new opcodes:
+```go
+SUBSCRIBE        OpCode = 0x5c
+UNSUBSCRIBE      OpCode = 0x5d
+NOTIFYSUBSCRIBERS OpCode = 0x5e
+```
+- Update the opcode string map at the bottom of the file
+
+**File: `core/vm/instructions.go`**
+- Location: Add new functions (around line 900+, after existing opcodes)
+- Implement:
+  - `opSubscribe()` - handles SUBSCRIBE opcode
+  - `opUnsubscribe()` - handles UNSUBSCRIBE opcode
+  - `opNotifySubscribers()` - handles NOTIFYSUBSCRIBERS opcode
+
+**File: `core/vm/jump_table.go`**
+- Location: In the appropriate fork's instruction set (e.g., `newPragueInstructionSet()` or create new fork)
+- Register the three new opcodes with their gas costs and execution functions
+- Example location: Around line 1000-1100 where LOG0-LOG4 are defined
+
+### 2. Gas Pricing
+
+**File: `core/vm/gas_table.go`**
+- Add gas calculation functions:
+  - `gasSubscribe()` - returns 20,000 + storage costs
+  - `gasUnsubscribe()` - returns 5,000 + storage refund
+  - `gasNotifySubscribers()` - returns 2,000 + (500 * num_subscribers)
+
+**File: `params/protocol_params.go`**
+- Add gas constants:
+```go
+SubscribeGas        uint64 = 20000
+UnsubscribeGas      uint64 = 5000
+NotifySubscribersGas uint64 = 2000
+PerSubscriberGas    uint64 = 500
+```
+
+### 3. EVM Core Modifications
+
+**File: `core/vm/evm.go`**
+- Location: Line 91-133 (EVM struct definition)
+- Add new fields to EVM struct:
+```go
+SubscriptionManager *SubscriptionManager
+PendingCallbacks    []*CallbackExecution
+```
+- Modify `NewEVM()` function to initialize subscription manager
+- Add `ProcessCallbacks()` method to execute pending callbacks after main execution
+- Add `executeCallback()` method for isolated callback execution
+
+**File: `core/vm/interface.go`**
+- Location: Line 30-104 (StateDB interface)
+- Extend StateDB interface with subscription methods:
+```go
+AddSubscription(...)
+RemoveSubscription(...)
+GetSubscription(...)
+GetSubscribers(...)
+```
+
+### 4. LOG Opcode Modification
+
+**File: `core/vm/instructions.go`**
+- Location: Line 926 (makeLog function)
+- Modify the `makeLog()` function to:
+  1. Check if event is subscribable
+  2. Call `NotifySubscribers` if subscribable
+  3. Schedule callbacks for execution
+
+### 5. Subscription Manager (New File)
+
+**Create New File: `core/vm/subscription_manager.go`**
+- Implement:
+  - `SubscriptionManager` struct
+  - `Subscribe()` method
+  - `Unsubscribe()` method
+  - `NotifySubscribers()` method
+  - `CallbackExecution` struct
+- This is the core logic for managing subscriptions
+
+### 6. State Database Extensions
+
+**File: `core/state/statedb.go`**
+- Location: Line 80-133 (StateDB struct)
+- Add new field:
+```go
+subscriptionTrie Trie
+subscriptionCache *lru.Cache
+```
+- Implement subscription storage methods
+- Add methods to persist/retrieve subscriptions from the subscription trie
+
+**File: `core/state/database.go`**
+- Add support for the subscription trie in the database layer
+
+### 7. Precompile for Subscription Manager
+
+**File: `core/vm/contracts.go`**
+- Location: Around line 61-93 (precompile contract maps)
+- Add new precompile at address `0x0a`:
+```go
+common.BytesToAddress([]byte{0xa}): &subscriptionManagerPrecompile{},
+```
+- Implement the `subscriptionManagerPrecompile` struct with methods:
+  - `deposit()`
+  - `withdraw()`
+  - `getBalance()`
+  - `getSubscriptionInfo()`
+
+### 8. Types Definitions
+
+**Create New File: `core/types/subscription.go`**
+- Define:
+  - `Subscription` struct
+  - `CallbackExecution` struct
+  - Serialization/deserialization methods (RLP encoding)
+
+**File: `core/types/log.go`**
+- Potentially extend Log type to include subscribable metadata
+
+### 9. RPC API Extensions
+
+**File: `internal/ethapi/api.go`**
+- Add new RPC methods to PublicBlockChainAPI:
+  - `eth_getSubscriptions(address)` - Returns all subscriptions for an address
+  - `eth_getSubscription(subscriptionId)` - Returns subscription details
+  - `eth_getCallbackHistory(subscriptionId, fromBlock, toBlock)` - Returns callback execution history
+
+### 10. Constants and Addresses
+
+**File: `params/protocol_params.go`**
+- Add special addresses:
+```go
+var (
+    SubscriptionDispatcherAddress = common.HexToAddress("0xFFfFfFffFFfffFFfFFfFFFFFffFFFffffFfFFFfF")
+    SubscriptionManagerAddress    = common.HexToAddress("0x000000000000000000000000000000000000000a")
+)
+```
+
+### 11. Chain Configuration and Activation
+
+**File: `params/config.go`**
+- Add EIP-8078 activation block/timestamp to chain configs:
+```go
+EIP8078Block *big.Int `json:"eip8078Block,omitempty"`
+```
+- Add feature flag check methods
+
+**File: `core/vm/eips.go`**
+- Create activation function:
+```go
+func enable8078(jt *JumpTable) {
+    jt[SUBSCRIBE] = &operation{
+        execute:     opSubscribe,
+        constantGas: params.SubscribeGas,
+        minStack:    minStack(6, 1),
+        maxStack:    maxStack(6, 1),
+    }
+    jt[UNSUBSCRIBE] = &operation{
+        execute:     opUnsubscribe,
+        constantGas: params.UnsubscribeGas,
+        minStack:    minStack(1, 1),
+        maxStack:    maxStack(1, 1),
+    }
+    jt[NOTIFYSUBSCRIBERS] = &operation{
+        execute:     opNotifySubscribers,
+        dynamicGas:  gasNotifySubscribers,
+        minStack:    minStack(3, 1),
+        maxStack:    maxStack(3, 1),
+    }
+}
+```
+
+### Implementation Order Recommendation
+
+1. **Types and constants** (Steps 8, 10) - Foundation types and addresses
+2. **Subscription manager** (Step 5) - Core subscription logic
+3. **Opcodes** (Step 1) - Define and register new opcodes
+4. **Gas pricing** (Step 2) - Gas cost calculations
+5. **EVM core** (Steps 3, 4) - EVM modifications and LOG updates
+6. **State database** (Step 6) - Persistent storage for subscriptions
+7. **Precompile** (Step 7) - Subscription management interface
+8. **RPC methods** (Step 9) - External query interface
+9. **Chain config** (Step 11) - Activation logic
+10. **Tests** - Comprehensive test suite for each component
+
+### Key Files Summary
+
+**New Files to Create:**
+- `core/vm/subscription_manager.go` - Core subscription management logic
+- `core/types/subscription.go` - Subscription data structures
+
+**Existing Files to Modify:**
+- `core/vm/opcodes.go` - Opcode definitions
+- `core/vm/instructions.go` - Opcode implementations
+- `core/vm/jump_table.go` - Opcode registration
+- `core/vm/gas_table.go` - Gas cost functions
+- `core/vm/evm.go` - EVM struct and execution flow
+- `core/vm/interface.go` - StateDB interface extension
+- `core/vm/contracts.go` - Precompile registration
+- `core/vm/eips.go` - EIP activation function
+- `core/state/statedb.go` - State database with subscription trie
+- `core/state/database.go` - Database layer for subscriptions
+- `internal/ethapi/api.go` - RPC API methods
+- `params/protocol_params.go` - Gas constants and addresses
+- `params/config.go` - Chain configuration
+
+### Testing Strategy
+
+Each component should include:
+- Unit tests for individual functions
+- Integration tests for subscription lifecycle
+- Gas cost verification tests
+- State persistence tests
+- Callback execution isolation tests
+- Failure mode tests (out of gas, reverts, etc.)
+- RPC API tests
+
+## Implementation Guide for Solidity Compiler
+
+This section provides a detailed roadmap for implementing EIP-8078 support in the Solidity compiler.
+
+### Overview
+
+The Solidity compiler needs to support:
+1. `subscribable` keyword for events
+2. `gasHint(uint256)` annotation for events
+3. `subscribe` statement for creating subscriptions
+4. `unsubscribe` statement for removing subscriptions
+5. Built-in subscription management functions
+6. Extended ABI with subscribable metadata
+
+### 1. Add New Keywords and Tokens
+
+**File: `liblangutil/Token.h`**
+- Location: Around line 145-196 (in the keyword section of TOKEN_LIST macro)
+- Add new keywords:
+
+```cpp
+K(Subscribable, "subscribable", 0)  // Add after line 158 (after Event)
+K(Subscribe, "subscribe", 0)        // Add after Subscribable
+K(Unsubscribe, "unsubscribe", 0)    // Add after Subscribe
+K(GasHint, "gasHint", 0)            // Add for gasHint annotation
+```
+
+**Purpose**: Defines the lexical tokens for the new keywords that the scanner will recognize.
+
+### 2. Extend EventDefinition AST Node
+
+**File: `libsolidity/ast/AST.h`**
+- Location: Line 1293-1334 (EventDefinition class)
+- Modify the EventDefinition class:
+
+```cpp
+class EventDefinition: public CallableDeclaration, public StructurallyDocumented, public ScopeOpener
+{
+public:
+	EventDefinition(
+		int64_t _id,
+		SourceLocation const& _location,
+		ASTPointer<ASTString> const& _name,
+		SourceLocation _nameLocation,
+		ASTPointer<StructuredDocumentation> const& _documentation,
+		ASTPointer<ParameterList> const& _parameters,
+		bool _anonymous = false,
+		bool _subscribable = false,          // NEW: Add subscribable flag
+		std::optional<uint256_t> _gasHint = std::nullopt  // NEW: Add gas hint
+	):
+		CallableDeclaration(_id, _location, _name, std::move(_nameLocation), Visibility::Default, _parameters),
+		StructurallyDocumented(_documentation),
+		m_anonymous(_anonymous),
+		m_subscribable(_subscribable),      // NEW
+		m_gasHint(_gasHint)                 // NEW
+	{
+	}
+
+	void accept(ASTVisitor& _visitor) override;
+	void accept(ASTConstVisitor& _visitor) const override;
+
+	bool isAnonymous() const { return m_anonymous; }
+	bool isSubscribable() const { return m_subscribable; }  // NEW
+	std::optional<uint256_t> gasHint() const { return m_gasHint; }  // NEW
+
+	Type const* type() const override;
+	FunctionTypePointer functionType(bool /*_internal*/) const override;
+
+	bool isVisibleInDerivedContracts() const override { return true; }
+	bool isVisibleViaContractTypeAccess() const override { return true; }
+
+	EventDefinitionAnnotation& annotation() const override;
+
+	CallableDeclaration const& resolveVirtual(
+		ContractDefinition const&,
+		ContractDefinition const*
+	) const override
+	{
+		return *this;
+	}
+
+private:
+	bool m_anonymous = false;
+	bool m_subscribable = false;           // NEW
+	std::optional<uint256_t> m_gasHint;    // NEW
+};
+```
+
+**Purpose**: Stores the subscribable flag and gasHint value in the AST node.
+
+### 3. Modify Parser to Handle Subscribable Events
+
+**File: `libsolidity/parsing/Parser.cpp`**
+- Location: Line 1074-1096 (parseEventDefinition function)
+- Modify to parse subscribable keyword and gasHint:
+
+```cpp
+ASTPointer<EventDefinition> Parser::parseEventDefinition()
+{
+	RecursionGuard recursionGuard(*this);
+	ASTNodeFactory nodeFactory(*this);
+	ASTPointer<StructuredDocumentation> documentation = parseStructuredDocumentation();
+
+	// NEW: Check for subscribable keyword
+	bool subscribable = false;
+	if (m_scanner->currentToken() == Token::Subscribable)
+	{
+		subscribable = true;
+		advance();
+	}
+
+	expectToken(Token::Event);
+	auto [name, nameLocation] = expectIdentifierWithLocation();
+
+	VarDeclParserOptions options;
+	options.allowIndexed = true;
+	ASTPointer<ParameterList> parameters = parseParameterList(options);
+
+	bool anonymous = false;
+	if (m_scanner->currentToken() == Token::Anonymous)
+	{
+		anonymous = true;
+		advance();
+	}
+
+	// NEW: Parse gasHint annotation
+	std::optional<uint256_t> gasHint;
+	if (m_scanner->currentToken() == Token::GasHint)
+	{
+		advance();
+		expectToken(Token::LParen);
+		// Parse the gas hint value (should be a number literal)
+		if (m_scanner->currentToken() == Token::Number)
+		{
+			gasHint = parseNumber();
+			advance();
+		}
+		expectToken(Token::RParen);
+	}
+
+	nodeFactory.markEndPosition();
+	expectToken(Token::Semicolon);
+	return nodeFactory.createNode<EventDefinition>(
+		name,
+		nameLocation,
+		documentation,
+		parameters,
+		anonymous,
+		subscribable,  // NEW
+		gasHint        // NEW
+	);
+}
+```
+
+**Purpose**: Parses the subscribable keyword and gasHint annotation from the source code.
+
+### 4. Add Subscribe/Unsubscribe Statement AST Nodes
+
+**File: `libsolidity/ast/AST.h`**
+- Location: After EmitStatement (around line 1970+)
+- Add new statement types:
+
+```cpp
+/**
+ * Statement for subscribing to an event.
+ * Example: subscribe targetContract.Transfer(from, to, value)
+ *            with onTransfer(from, to, value)
+ *            gasLimit 150000
+ *            gasPrice 20 gwei;
+ */
+class SubscribeStatement: public Statement
+{
+public:
+	SubscribeStatement(
+		int64_t _id,
+		SourceLocation const& _location,
+		ASTPointer<FunctionCall> const& _eventCall,
+		ASTPointer<Identifier> const& _callbackFunction,
+		ASTPointer<Expression> const& _gasLimit,
+		ASTPointer<Expression> const& _gasPrice
+	):
+		Statement(_id, _location),
+		m_eventCall(_eventCall),
+		m_callbackFunction(_callbackFunction),
+		m_gasLimit(_gasLimit),
+		m_gasPrice(_gasPrice)
+	{}
+
+	void accept(ASTVisitor& _visitor) override;
+	void accept(ASTConstVisitor& _visitor) const override;
+
+	FunctionCall const& eventCall() const { return *m_eventCall; }
+	Identifier const& callbackFunction() const { return *m_callbackFunction; }
+	Expression const& gasLimit() const { return *m_gasLimit; }
+	Expression const& gasPrice() const { return *m_gasPrice; }
+
+	SubscribeStatementAnnotation& annotation() const override;
+
+private:
+	ASTPointer<FunctionCall> m_eventCall;
+	ASTPointer<Identifier> m_callbackFunction;
+	ASTPointer<Expression> m_gasLimit;
+	ASTPointer<Expression> m_gasPrice;
+};
+
+/**
+ * Statement for unsubscribing from an event.
+ * Example: unsubscribe targetContract.Transfer;
+ */
+class UnsubscribeStatement: public Statement
+{
+public:
+	UnsubscribeStatement(
+		int64_t _id,
+		SourceLocation const& _location,
+		ASTPointer<MemberAccess> const& _eventAccess
+	):
+		Statement(_id, _location),
+		m_eventAccess(_eventAccess)
+	{}
+
+	void accept(ASTVisitor& _visitor) override;
+	void accept(ASTConstVisitor& _visitor) const override;
+
+	MemberAccess const& eventAccess() const { return *m_eventAccess; }
+
+	UnsubscribeStatementAnnotation& annotation() const override;
+
+private:
+	ASTPointer<MemberAccess> m_eventAccess;
+};
+```
+
+**Purpose**: Defines AST nodes for subscribe and unsubscribe statements.
+
+### 5. Extend Parser for Subscribe/Unsubscribe Statements
+
+**File: `libsolidity/parsing/Parser.cpp`**
+- Location: Add new parsing functions (around line 700+, where other statement parsers are)
+- Add these functions:
+
+```cpp
+ASTPointer<Statement> Parser::parseSubscribeStatement()
+{
+	RecursionGuard recursionGuard(*this);
+	ASTNodeFactory nodeFactory(*this);
+
+	expectToken(Token::Subscribe);
+
+	// Parse: targetContract.EventName(params)
+	ASTPointer<FunctionCall> eventCall = parseFunctionCall(parseExpression());
+
+	// Parse: with callbackFunction
+	expectToken(Token::With);
+	ASTPointer<Identifier> callback = parseIdentifier();
+
+	// Parse: gasLimit <value>
+	expectToken(Token::GasLimit);
+	ASTPointer<Expression> gasLimit = parseExpression();
+
+	// Parse: gasPrice <value>
+	expectToken(Token::GasPrice);
+	ASTPointer<Expression> gasPrice = parseExpression();
+
+	nodeFactory.markEndPosition();
+	expectToken(Token::Semicolon);
+
+	return nodeFactory.createNode<SubscribeStatement>(
+		eventCall,
+		callback,
+		gasLimit,
+		gasPrice
+	);
+}
+
+ASTPointer<Statement> Parser::parseUnsubscribeStatement()
+{
+	RecursionGuard recursionGuard(*this);
+	ASTNodeFactory nodeFactory(*this);
+
+	expectToken(Token::Unsubscribe);
+
+	// Parse: targetContract.EventName
+	ASTPointer<MemberAccess> eventAccess = parseMemberAccess(parseExpression());
+
+	nodeFactory.markEndPosition();
+	expectToken(Token::Semicolon);
+
+	return nodeFactory.createNode<UnsubscribeStatement>(eventAccess);
+}
+```
+
+**File: `libsolidity/parsing/Parser.cpp`**
+- Location: In parseStatement function (around line 600+)
+- Add cases for new tokens:
+
+```cpp
+case Token::Subscribe:
+	return parseSubscribeStatement();
+case Token::Unsubscribe:
+	return parseUnsubscribeStatement();
+```
+
+**Purpose**: Parses subscribe and unsubscribe statements from source code.
+
+### 6. Update ABI Generation
+
+**File: `libsolidity/interface/ABI.cpp`**
+- Location: Line 105-122 (event processing loop)
+- Modify to include subscribable and gasHint in ABI:
+
+```cpp
+for (auto const& it: _contractDef.interfaceEvents())
+{
+	Json event;
+	event["type"] = "event";
+	event["name"] = it->name();
+	event["anonymous"] = it->isAnonymous();
+
+	// NEW: Add subscribable flag
+	if (it->isSubscribable())
+	{
+		event["subscribable"] = true;
+		if (it->gasHint().has_value())
+			event["gasHint"] = it->gasHint().value();
+	}
+
+	Json params = Json::array();
+	for (auto const& p: it->parameters())
+	{
+		Type const* type = p->annotation().type->interfaceType(false);
+		solAssert(type, "");
+		auto param = formatType(p->name(), *type, *p->annotation().type, false);
+		param["indexed"] = p->isIndexed();
+		params.emplace_back(param);
+	}
+	event["inputs"] = std::move(params);
+	abi.emplace(std::move(event));
+}
+```
+
+**Purpose**: Adds subscribable and gasHint fields to the contract ABI JSON.
+
+### 7. Code Generation for Subscribe Opcode
+
+**File: `libsolidity/codegen/ir/IRGeneratorForStatements.cpp`**
+- Add visitor for SubscribeStatement (around line 300+):
+
+```cpp
+bool IRGeneratorForStatements::visit(SubscribeStatement const& _subscribe)
+{
+	_subscribe.eventCall().accept(*this);
+	_subscribe.callbackFunction().accept(*this);
+	_subscribe.gasLimit().accept(*this);
+	_subscribe.gasPrice().accept(*this);
+
+	// Get the event definition from the function call
+	FunctionCall const& eventCall = _subscribe.eventCall();
+	EventDefinition const* eventDef = dynamic_cast<EventDefinition const*>(
+		eventCall.expression().annotation().referencedDeclaration
+	);
+
+	solAssert(eventDef, "Subscribe target must be an event");
+
+	// Extract target contract address
+	MemberAccess const* memberAccess = dynamic_cast<MemberAccess const*>(&eventCall.expression());
+	solAssert(memberAccess, "Event must be accessed via contract");
+
+	Expression const& targetContract = memberAccess->expression();
+	targetContract.accept(*this);
+
+	// Generate SUBSCRIBE opcode call
+	appendCode() << "{\n";
+	appendCode() << "  let targetAddress := " << IRVariable(targetContract).name() << "\n";
+	appendCode() << "  let eventSig := " << eventSignatureHash(*eventDef) << "\n";
+	appendCode() << "  let callbackAddr := address()\n";  // Current contract
+	appendCode() << "  let callbackSel := " << functionSelector(_subscribe.callbackFunction()) << "\n";
+	appendCode() << "  let gasLim := " << IRVariable(_subscribe.gasLimit()).name() << "\n";
+	appendCode() << "  let gasPr := " << IRVariable(_subscribe.gasPrice()).name() << "\n";
+	appendCode() << "  \n";
+	appendCode() << "  // Call SUBSCRIBE opcode (0x5c)\n";
+	appendCode() << "  let subscriptionId := verbatim_6i_1o(\n";
+	appendCode() << "    hex\"5c\",\n";  // SUBSCRIBE opcode
+	appendCode() << "    targetAddress, eventSig, callbackAddr, callbackSel, gasLim, gasPr\n";
+	appendCode() << "  )\n";
+	appendCode() << "}\n";
+
+	return false;
+}
+```
+
+**Purpose**: Generates Yul IR code that invokes the SUBSCRIBE opcode (0x5c).
+
+### 8. Add Built-in Subscription Functions
+
+**File: `libsolidity/analysis/GlobalContext.cpp`**
+- Add built-in functions for subscription management:
+
+```cpp
+m_magicVariables.emplace_back("isSubscribedTo",
+	TypeProvider::function(
+		strings{"address", "string"},
+		strings{"bool"},
+		FunctionType::Kind::IsSubscribedTo,
+		StateMutability::View
+	)
+);
+
+m_magicVariables.emplace_back("getSubscription",
+	TypeProvider::function(
+		strings{"address", "string"},
+		strings{"uint256", "uint256", "address"},  // gasLimit, gasPrice, callback
+		FunctionType::Kind::GetSubscription,
+		StateMutability::View
+	)
+);
+
+m_magicVariables.emplace_back("updateSubscription",
+	TypeProvider::function(
+		strings{"address", "string", "uint256", "uint256"},
+		strings{},
+		FunctionType::Kind::UpdateSubscription,
+		StateMutability::NonPayable
+	)
+);
+```
+
+**Purpose**: Makes subscription management functions available globally in all contracts.
+
+### 9. Add New FunctionType Kinds
+
+**File: `libsolidity/ast/Types.h`**
+- Location: In FunctionType::Kind enum (around line 1200+)
+- Add new kinds:
+
+```cpp
+enum class Kind
+{
+	// ... existing kinds ...
+	IsSubscribedTo,
+	GetSubscription,
+	UpdateSubscription,
+	// ...
+};
+```
+
+**Purpose**: Defines function type kinds for built-in subscription functions.
+
+### Implementation Order Recommendation
+
+1. **Tokens and Keywords** (Step 1) - Foundation
+2. **AST Node Extensions** (Steps 2, 4) - Data structures
+3. **Parser Modifications** (Steps 3, 5) - Source code parsing
+4. **ABI Generation** (Step 6) - Contract interface
+5. **Built-in Functions** (Steps 8, 9) - Runtime support
+6. **Code Generation** (Step 7) - Opcode emission
+7. **Testing** - Comprehensive test suite
+
+### Key Files Summary
+
+**Files to Modify:**
+- `liblangutil/Token.h` - Add keywords (subscribable, subscribe, unsubscribe, gasHint)
+- `libsolidity/ast/AST.h` - Extend EventDefinition, add SubscribeStatement/UnsubscribeStatement
+- `libsolidity/ast/Types.h` - Add FunctionType kinds
+- `libsolidity/parsing/Parser.h` - Add parser function declarations
+- `libsolidity/parsing/Parser.cpp` - Implement parsing logic for new syntax
+- `libsolidity/interface/ABI.cpp` - Extend ABI generation with subscribable metadata
+- `libsolidity/codegen/ir/IRGeneratorForStatements.cpp` - Generate SUBSCRIBE/UNSUBSCRIBE opcodes
+- `libsolidity/analysis/GlobalContext.cpp` - Add built-in subscription functions
+- `libsolidity/ast/ASTVisitor.h` - Add visitor methods for new statement types
+
+**New Functionality Added:**
+- Keyword recognition for subscription syntax
+- AST representation of subscribable events and subscription statements
+- Parser support for new language constructs
+- ABI metadata for subscribable events
+- Code generation for subscription opcodes
+- Built-in functions for subscription management
+
+### Testing Strategy
+
+Each component should include:
+- **Parser Tests**: Test parsing of subscribable events and subscribe statements
+- **AST Tests**: Verify AST node creation and structure
+- **Type Checking Tests**: Ensure proper type validation for subscription statements
+- **ABI Tests**: Verify ABI output includes subscribable and gasHint metadata
+- **Code Generation Tests**: Check correct opcode generation for subscribe/unsubscribe
+- **Integration Tests**: End-to-end compilation tests
+- **Semantic Tests**: Runtime behavior verification with test contracts
+
+## Test Cases
+
+### Test Case 1: Basic Subscription and Callback
+
+```solidity
+function testBasicSubscription() public {
+    // Deploy oracle
+    PriceOracle oracle = new PriceOracle();
+
+    // Deploy subscriber with gas deposit
+    DerivedProtocol subscriber = new DerivedProtocol{value: 1 ether}(
+        address(oracle)
+    );
+
+    // Verify subscription created
+    assertTrue(subscriber.isSubscribedTo(address(oracle), "PriceUpdated"));
+
+    // Emit event
+    oracle.updatePrice(1000);
+
+    // Verify callback executed
+    assertEq(subscriber.lastSyncedPrice(), 1000);
+}
+```
+
+### Test Case 2: Callback Out of Gas
+
+```solidity
+function testCallbackOutOfGas() public {
+    // Create subscription with insufficient gas
+    DerivedProtocol subscriber = new DerivedProtocol{value: 1 ether}(
+        address(oracle)
+    );
+    subscriber.updateSubscription(address(oracle), "PriceUpdated", 10000, 20 gwei); // Too low
+
+    // Emit event
+    oracle.updatePrice(1000);
+
+    // Verify original transaction succeeded
+    assertEq(oracle.price(), 1000);
+
+    // Verify callback failed gracefully
+    assertEq(subscriber.lastSyncedPrice(), 0); // Not updated
+
+    // Verify failure was logged
+    // (check logs for CallbackFailed event)
+}
+```
+
+### Test Case 3: Insufficient Deposit
+
+```solidity
+function testInsufficientDeposit() public {
+    DerivedProtocol subscriber = new DerivedProtocol{value: 0.001 ether}(
+        address(oracle)
+    );
+
+    // Emit events until deposit exhausted
+    for (uint i = 0; i < 100; i++) {
+        oracle.updatePrice(i);
+    }
+
+    // Verify early events succeeded
+    assertTrue(subscriber.lastSyncedPrice() > 0);
+
+    // Verify later events skipped due to insufficient deposit
+    assertLt(subscriber.lastSyncedPrice(), 99);
+}
+```
+
+### Test Case 4: Multiple Subscribers
+
+```solidity
+function testMultipleSubscribers() public {
+    PriceOracle oracle = new PriceOracle();
+
+    DerivedProtocol sub1 = new DerivedProtocol{value: 1 ether}(address(oracle));
+    DerivedProtocol sub2 = new DerivedProtocol{value: 1 ether}(address(oracle));
+    DerivedProtocol sub3 = new DerivedProtocol{value: 1 ether}(address(oracle));
+
+    // Emit event
+    oracle.updatePrice(500);
+
+    // Verify all callbacks executed
+    assertEq(sub1.lastSyncedPrice(), 500);
+    assertEq(sub2.lastSyncedPrice(), 500);
+    assertEq(sub3.lastSyncedPrice(), 500);
+}
+```
+
+### Test Case 5: Unsubscribe
+
+```solidity
+function testUnsubscribe() public {
+    DerivedProtocol subscriber = new DerivedProtocol{value: 1 ether}(
+        address(oracle)
+    );
+
+    // Verify subscribed
+    assertTrue(subscriber.isSubscribedTo(address(oracle), "PriceUpdated"));
+
+    // Unsubscribe
+    subscriber.cleanup(address(oracle));
+
+    // Verify unsubscribed
+    assertFalse(subscriber.isSubscribedTo(address(oracle), "PriceUpdated"));
+
+    // Emit event
+    oracle.updatePrice(1000);
+
+    // Verify callback not executed
+    assertEq(subscriber.lastSyncedPrice(), 0);
+}
+```
+
+### Pull Requests
+
+* Solidity Compiler https://github.com/argotorg/solidity/pull/16289/files
+
+## Copyright
+
+Copyright and related rights waived via [CC0](../LICENSE.md).
